@@ -1,0 +1,378 @@
+// gucci-wiki — Prisma schema
+// Модели минимальны там, где функциональность реализуется в следующих кусках
+// (поиск — кусок 3, свежесть — 4, настройки/S3/бот — 5-7, права — 8),
+// но уже мигрируются, чтобы куски могли просто добавлять поля/индексы.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+// Регистрация с подтверждением админом (кусок 1): саморегистрация создаёт
+// PENDING, войти нельзя, пока админ не подтвердит (→ ACTIVE) в /admin/users
+// (кусок 2). Первый пользователь минует PENDING — ACTIVE сразу.
+enum UserStatus {
+  PENDING
+  ACTIVE
+}
+
+// Статус последнего прогона автобэкапа БД (см. Settings.backupLastStatus) —
+// только для отображения в /settings, не влияет на логику включения.
+enum BackupStatus {
+  OK
+  ERROR
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  name         String
+  // VIEWER — минимум прав: единственный путь создания пользователя
+  // (регистрация) всегда указывает роль явно, но дефолт схемы — это
+  // fail-safe на случай будущего пути создания без явной роли.
+  role         Role       @default(VIEWER)
+  status       UserStatus @default(PENDING)
+  createdAt    DateTime   @default(now())
+
+  // Telegram-оповещения (кусок 7) — заполняются, когда пользователь
+  // проходит deep-link активацию бота. activationToken — персональная
+  // ссылка t.me/<bot>?start=<token>; activatedAt проставляется вебхуком
+  // в момент реального /start в боте (тогда же приходит chatId).
+  telegramChatId          String?   @unique
+  telegramActivationToken String?   @unique
+  telegramActivatedAt     DateTime?
+
+  // Свежесть/уведомления (кусок 4): последний раз, когда пользователь
+  // реально что-то делал в приложении (сейчас — вход в систему). Нужен,
+  // чтобы понять, что автор статьи "ушёл", и эскалировать напоминание
+  // владельцу пространства.
+  lastActiveAt DateTime @default(now())
+
+  spaces          Space[]          @relation("SpaceOwner")
+  pages           Page[]           @relation("PageAuthor")
+  pageVersions    PageVersion[]
+  notifications   Notification[]
+  questions       Question[]
+  roadmaps        Roadmap[]
+  fileFolders     FileFolder[]
+  fileItems       FileItem[]
+  fileCollections FileCollection[]
+
+  // @@index([email]) не нужен отдельно — @unique выше уже создаёт индекс
+  // на то же поле; дублирующий индекс только замедлял бы каждую вставку.
+}
+
+model Space {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  icon        String?
+  color       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // "Владелец пространства" (Editor) — адресат эскалации при
+  // неактивности автора статьи (кусок 4).
+  ownerId String?
+  owner   User?   @relation("SpaceOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  pages Page[]
+}
+
+model Page {
+  id      String @id @default(cuid())
+  title   String
+  slug    String
+  content String @default("")
+
+  spaceId String
+  space   Space  @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  authorId String?
+  author   User?   @relation("PageAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Признак «статья опубликована», а не пустая заглушка «Новая статья»
+  // (QA-прогон 4). Раньше это вычислялось сравнением всего HTML со строкой
+  // EMPTY_CONTENT: такой предикат не покрывается индексом и заставлял
+  // Postgres читать и распаковывать из TOAST `content` каждой статьи — в том
+  // числе там, где само содержимое не выбиралось (счётчики статей у
+  // пространств на главной). Выставляется в updatePageAction при каждом
+  // сохранении: непустое содержимое → true, возврат к заглушке → false.
+  published Boolean @default(false)
+
+  // Свежесть (кусок 4): ручной TTL + последняя проверка.
+  reviewIntervalDays Int      @default(90)
+  lastReviewedAt     DateTime @default(now())
+
+  // Автосигнал низкой посещаемости (кусок 4): когда статью последний раз
+  // реально открывали. Инкрементируется при просмотре /pages/[id].
+  viewCount    Int       @default(0)
+  lastViewedAt DateTime?
+
+  versions PageVersion[]
+
+  // Поиск (кусок 3): searchText/searchVector поддерживаются триггером в
+  // миграции 20260905000000_page_fulltext_search — плоский текст (title +
+  // content без HTML-тегов, абзацы разделены \n) и tsvector от него,
+  // пересчитываются в БД на каждый INSERT/UPDATE title или content, так что
+  // индекс не может рассинхронизироваться с содержимым статьи.
+  searchText   String                   @default("")
+  searchVector Unsupported("tsvector")?
+
+  @@unique([spaceId, slug])
+  @@index([spaceId])
+  // Списки статей пространства и счётчики на главной всегда фильтруют по
+  // published — составной индекс покрывает и фильтр, и отбор по пространству.
+  @@index([spaceId, published])
+  @@index([searchVector], type: Gin)
+  // Главная страница сортирует статьи по updatedAt DESC («последние
+  // изменения») и по viewCount DESC («популярные») с LIMIT — без индексов
+  // каждый заход на главную сортировал всю таблицу статей (QA-прогон 3).
+  @@index([updatedAt])
+  @@index([viewCount])
+}
+
+model PageVersion {
+  id        String   @id @default(cuid())
+  pageId    String
+  page      Page     @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  content   String
+  createdAt DateTime @default(now())
+
+  authorId String?
+  author   User?   @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([pageId])
+}
+
+// Singleton-строка (id фиксирован) — S3-бакет и токен Telegram-бота,
+// правятся только через /settings (кусок 5), не через .env/код.
+model Settings {
+  id String @id @default("singleton")
+
+  s3Endpoint  String?
+  s3Bucket    String?
+  s3Region    String?
+  s3AccessKey String?
+  s3SecretKey String?
+
+  telegramBotToken String?
+
+  // Персонализация (карты/файлы/личный кабинет, кусок 4): логотип и название
+  // компании. logoKey — ключ объекта в S3 (нужен, чтобы при загрузке нового
+  // логотипа удалить старый объект из бакета, а не просто перезаписать
+  // ссылку); logoUrl — публичная ссылка, отдаётся как есть (не секрет).
+  companyName String?
+  logoUrl     String?
+  logoKey     String?
+
+  // Автобэкап БД в S3 (QA-прогон 2, отчёт по отказоустойчивости) — явный
+  // чекбокс в /settings, НЕ включается сам по факту настройки S3 выше.
+  // backupLastAt/backupLastStatus/backupLastError пишет только
+  // lib/backup/service.ts (не форма пользователя) — видимость последнего
+  // прогона без отдельной таблицы истории.
+  backupEnabled    Boolean       @default(false)
+  backupLastAt     DateTime?
+  backupLastStatus BackupStatus?
+  backupLastError  String?
+
+  updatedAt DateTime @updatedAt
+}
+
+// Внутриприкладные уведомления (кусок 4) — колокольчик в топбаре.
+// Сейчас источник — только свежесть статей (freshness_reminder /
+// freshness_escalation), но модель нарочно нейтральна по типу: любой
+// будущий кусок (например, кусок 7 — Telegram) может писать сюда же
+// through `type`/`message`/`link`, чтобы событие сразу попало и в
+// колокольчик, а не только в свой канал.
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type    String
+  message String
+  link    String?
+  read    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+  // Список уведомлений пользователя всегда идёт orderBy createdAt DESC —
+  // индекс [userId, read] это не покрывает.
+  @@index([userId, createdAt])
+}
+
+// Вопросы с главной (кусок 4): любой залогиненный отправляет вопрос через
+// форму, он попадает во вкладку "Вопросы", видную Editor+Admin.
+// resolved — отметка "решено", вопрос не удаляется (история остаётся).
+model Question {
+  id        String   @id @default(cuid())
+  text      String
+  // SetNull, не Cascade: как и у Page/Roadmap/FileItem, удаление автора не
+  // должно стирать саму сущность — Editor/Admin теряют историю обращений
+  // именно тогда, когда она нужнее всего (при разборе, кто и что спрашивал).
+  authorId  String?
+  author    User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  resolved  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([resolved, createdAt])
+}
+
+// Статус этапа карты процесса (кусок 2) — те же четыре состояния, что на
+// референсе онбординга (assets/Онбординг.jpg): пройдено / текущий /
+// требует внимания / ещё впереди.
+enum RoadmapStageStatus {
+  DONE
+  ACTIVE
+  ATTENTION
+  UPCOMING
+}
+
+// Карта процесса (кусок 1-2, R01) — не привязана к Space: процесс обычно
+// межкомандный ("как вести клиента", "приём сотрудника" и т.п.), а не
+// принадлежит одному разделу вики.
+model Roadmap {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  authorId String?
+  author   User?   @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  stages RoadmapStage[]
+
+  @@index([createdAt])
+}
+
+// Этап основной цепочки (parentId = null) или ветка-исключение от другого
+// этапа (parentId → родитель, как "Эскалация" на референсе). order — позиция
+// среди "братьев" (общих parentId), меняется кнопками вверх/вниз в UI (кусок 5).
+model RoadmapStage {
+  id        String  @id @default(cuid())
+  roadmapId String
+  roadmap   Roadmap @relation(fields: [roadmapId], references: [id], onDelete: Cascade)
+
+  parentId String?
+  parent   RoadmapStage?  @relation("StageBranches", fields: [parentId], references: [id], onDelete: Cascade)
+  branches RoadmapStage[] @relation("StageBranches")
+
+  order Int @default(0)
+
+  title       String
+  status      RoadmapStageStatus @default(UPCOMING)
+  owner       String?
+  description String?
+
+  // Подпись на пунктирном коннекторе ветки, например "если решения нет 3 дня".
+  // Имеет смысл только когда parentId задан.
+  branchLabel String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([roadmapId, parentId, order])
+}
+
+// Папка на "виртуальной" файловой полке (кусок 1/3, R08) — дерево через
+// parentId, null = корень раздела "Файлы". Реальные байты — в S3, здесь
+// только структура и метаданные (см. FileItem).
+model FileFolder {
+  id   String @id @default(cuid())
+  name String
+
+  parentId String?
+  parent   FileFolder?  @relation("FolderChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children FileFolder[] @relation("FolderChildren")
+
+  createdAt DateTime @default(now())
+
+  authorId String?
+  author   User?   @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  files FileItem[]
+  // ВНИМАНИЕ. В БД есть ещё один индекс, которого здесь объявить нельзя:
+  //   CREATE UNIQUE INDEX "FileFolder_root_name_key"
+  //     ON "FileFolder"(name) WHERE "parentId" IS NULL;
+  // (миграция 20260905215500_chunk5_schema_audit). Он закрывает гонку в
+  // getOrCreateUnsortedFolder() — частичные уникальные индексы Prisma в
+  // схеме выражать не умеет. Из-за этого для Prisma он выглядит дрейфом
+  // БД, и `prisma migrate dev` сгенерирует миграцию с его DROP. Если
+  // будете менять схему через migrate dev — откройте получившийся
+  // migration.sql и удалите оттуда строку с DROP INDEX
+  // "FileFolder_root_name_key" до того, как она уедет в прод.
+
+  @@index([parentId])
+}
+
+// Метаданные загруженного файла (кусок 3, R09/R10) — key/url указывают на
+// объект в S3-бакете, настроенном в /settings; сами байты в БД не хранятся.
+model FileItem {
+  id       String      @id @default(cuid())
+  folderId String?
+  folder   FileFolder? @relation(fields: [folderId], references: [id], onDelete: Cascade)
+
+  name     String
+  key      String
+  url      String
+  mimeType String
+  size     Int
+
+  uploaderId String?
+  uploader   User?   @relation(fields: [uploaderId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  collectionItems FileCollectionItem[]
+
+  @@index([folderId])
+  // Файлы внутри папки читаются с orderBy createdAt — индекса по одному
+  // folderId для этого мало.
+  @@index([folderId, createdAt])
+}
+
+// Коллекция (кусок 3, R12) — именованная подборка уже загруженных файлов,
+// например "Отправить клиенту". Ссылается на существующие FileItem, файл
+// физически не копируется.
+model FileCollection {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  authorId String?
+  author   User?   @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  items FileCollectionItem[]
+}
+
+model FileCollectionItem {
+  id           String         @id @default(cuid())
+  collectionId String
+  collection   FileCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  fileId       String
+  file         FileItem       @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  order        Int            @default(0)
+
+  @@unique([collectionId, fileId])
+  @@index([collectionId, order])
+}

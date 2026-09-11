@@ -1,0 +1,71 @@
+# Компоуз для боевого сервера — только тянет уже собранный образ (CI
+# собирает его отдельно и пушит в GHCR), никогда не собирает из исходников.
+# Для локальной разработки — ../docker-compose.yml (там есть build).
+#
+# `name:` — явное имя compose-проекта. Без него Docker Compose называет
+# проект по имени ПАПКИ, где лежит файл — а на сервере, где рядом с другими
+# сервисами это тоже "deploy" (общепринятое имя каталога для файлов
+# деплоя), два независимых проекта незаметно слипаются в один. Тогда
+# `docker compose down` из одного каталога может задеть контейнеры чужого
+# сервиса.
+name: gucci-wiki
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gucci
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: gucci_wiki
+    volumes:
+      - gucci_wiki_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gucci"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Лимит — сервер может оказаться маленьким и делить ресурсы с другими
+    # сервисами на той же машине.
+    mem_limit: 250m
+
+  app:
+    image: ${APP_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://gucci:${POSTGRES_PASSWORD}@postgres:5432/gucci_wiki
+      SESSION_SECRET: ${SESSION_SECRET}
+      # Ключ шифрования секретов из /settings (ключи S3, токен бота) в БД —
+      # важен именно на проде, где дамп БД автобэкапом уезжает в S3. Пустой —
+      # секреты хранятся открытым текстом. Потеря ключа = настройки S3/бота
+      # ввести заново в /settings, данные вики при этом целы.
+      SETTINGS_KEY: ${SETTINGS_KEY:-}
+      NODE_ENV: production
+      # Адрес вики снаружи — авторитетный источник для абсолютных ссылок в
+      # Telegram и при регистрации вебхука. Пустой — берётся заголовок Host.
+      APP_ORIGIN: ${APP_ORIGIN:-}
+      # Необязательный секрет для внешнего вызова POST /api/freshness/recalculate.
+      # Пустой — эндпоинт доступен только админу с активной сессией.
+      CRON_SECRET: ${CRON_SECRET:-}
+    ports:
+      # 127.0.0.1, не 0.0.0.0 — наружу торчит только через nginx (TLS, домен).
+      # Без :? пустой APP_PORT даёт "127.0.0.1::3000" — Docker молча вешает
+      # контейнер на случайный порт, nginx стучится в 3000 и получает 502.
+      - "127.0.0.1:${APP_PORT:?APP_PORT не задан (порт на хосте, например 3000)}:3000"
+    mem_limit: 350m
+    # node -e с глобальным fetch, не curl/wget — node:24-alpine не
+    # гарантирует их наличие, Node ≥18 с fetch есть точно. /api/health
+    # проверяет и сам процесс, и доступность БД (SELECT 1). Используется
+    # шагом ожидания в .github/workflows/deploy.yml после `docker compose up`.
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  gucci_wiki_pg_data:

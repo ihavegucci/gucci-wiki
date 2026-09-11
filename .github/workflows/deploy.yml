@@ -1,0 +1,264 @@
+name: Build and Deploy
+
+# Сборка Docker-образа, публикация в GitHub Container Registry
+# (ghcr.io) и деплой на сервер по SSH — запускается вручную, кнопкой
+# "Run workflow" на вкладке Actions. Осознанно без триггера на push: сборка
+# и деплой на боевой сервер — отдельное, явное действие.
+#
+# Структура (по образцу уже проверенного в бою деплоя): все файлы, которые
+# нужны на сервере, лежат плоско в deploy/ — docker-compose.yml
+# (только тянет готовый образ, никогда не собирает), nginx-шаблоны,
+# setup-server.sh. Ничего в этом файле не привязано к конкретному домену,
+# порту или пути на сервере заказчика — это чистовик, который передаётся
+# клиентам как есть. Всё, что отличается от деплоя к деплою, задаётся
+# Secrets репозитория на GitHub (одно место, не Secrets+Variables вперемешку
+# — см. README, раздел «CI/CD и деплой», там же полный список).
+
+on:
+  workflow_dispatch: {}
+
+# Одна кнопка — весь цикл check → build → deploy. Без этого второй клик на
+# "Run workflow" во время ещё идущего деплоя мог столкнуться с первым на
+# одном и том же сервере (два параллельных `docker compose up -d`/`scp`).
+# cancel-in-progress: false — оборванный на середине деплой (после
+# `docker compose up -d`, до healthcheck-проверки) хуже, чем подождать своей
+# очереди.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_DIR: ${{ secrets.DEPLOY_DIR || '/opt/gucci-wiki/deploy' }}
+
+jobs:
+  # Раньше сборка и деплой ничем не подтверждались — тесты/линт/типы/сборка
+  # прогонялись только руками перед пушем. Теперь та же кнопка сначала это
+  # проверяет и останавливается на первой красной проверке, не доходя до
+  # сборки образа и тем более до боевого сервера.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run lint
+      # `LayoutProps`/`PageProps` и т.п. — глобальные типы, которые Next.js
+      # генерирует в .next/types только во время `next dev`/`build`/`typegen`
+      # (см. node_modules/next/dist/docs/.../typescript.md, раздел
+      # «Route-Aware Type Helpers»). На свежем чекауте в CI их ещё нет —
+      # без этого шага `tsc --noEmit` падает на "Cannot find name
+      # 'LayoutProps'" ещё до первой сборки. Локально это не проявлялось,
+      # потому что `.next/types` уже был сгенерирован прошлыми `npm run dev`/
+      # `build`.
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+
+  build-and-push:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Дефолтный buildx-драйвер ("docker") не умеет экспортировать кэш
+      # (--cache-to) вообще, только "docker-container" — этот шаг явно
+      # поднимает такой билдер. Без него cache-to: type=gha падает с
+      # "Cache export is not supported for the docker driver".
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Кэш слоёв между прогонами через сам GitHub Actions — без этого
+          # каждый деплой пересобирал `npm ci` с нуля.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # `scp-action` ниже коннектится как обычный SSH-пользователь и просто
+      # создаёт $DEPLOY_DIR, если его нет — под root это всегда получалось,
+      # потому что root пишет куда угодно. Под sudo-пользователем (root-логин
+      # закрыт) родитель ($DEPLOY_DIR/.. — обычно /opt) чаще всего root:root,
+      # и создание падает с "permission denied" ещё до первого файла. Этот
+      # шаг готовит каталог заранее, под sudo, и передаёт его во владение
+      # текущему SSH-пользователю — идемпотентно, безопасно гонять на
+      # каждом прогоне, включая деплои под root (`sudo` там просто не
+      # используется, id -u уже 0).
+      - name: Prepare deploy directory
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: DEPLOY_DIR
+          script: |
+            set -euo pipefail
+            SUDO=""
+            [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+            $SUDO mkdir -p "$DEPLOY_DIR"
+            $SUDO chown "$(whoami):$(whoami)" "$DEPLOY_DIR"
+
+      - name: Copy deploy files to server
+        # strip_components: 1 срезает "deploy/" — все файлы
+        # (docker-compose.yml, nginx/*.template, setup-server.sh) ложатся
+        # плоско прямо в $DEPLOY_DIR, на одном уровне друг с другом.
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "deploy/*"
+          target: ${{ env.DEPLOY_DIR }}
+          strip_components: 1
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          APP_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Значение по умолчанию, как у DEPLOY_DIR: без него незаданный
+          # секрет APP_PORT уезжал в setup-server.sh пустой строкой, и
+          # развёртывание падало на "UPSTREAM_PORT не задан" — при том что
+          # порт документирован как необязательный. Задавать секрет нужно
+          # только если 3000 на сервере уже занят.
+          APP_PORT: ${{ secrets.APP_PORT || '3000' }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          SETTINGS_KEY: ${{ secrets.SETTINGS_KEY }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: APP_IMAGE,APP_PORT,DOMAIN,POSTGRES_PASSWORD,SESSION_SECRET,SETTINGS_KEY,CRON_SECRET,LETSENCRYPT_EMAIL,GHCR_TOKEN,GHCR_USER
+          script: |
+            set -euo pipefail
+            cd "${{ env.DEPLOY_DIR }}"
+
+            # Пусто под root (id -u уже 0, sudo не нужен и не установлен на
+            # многих минимальных образах) — непусто под любым другим
+            # пользователем. Один и тот же скрипт работает в обоих случаях,
+            # ничего не зная заранее о том, кем он запущен. `-n` — если
+            # NOPASSWD вдруг не настроен, sudo сразу падает с понятной
+            # ошибкой ("a password is required"), а не виснет в SSH-сессии
+            # без TTY до таймаута джоба, ожидая пароль, который никто не
+            # введёт.
+            SUDO=""
+            [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+
+            cat > .env <<EOF
+            APP_IMAGE=$APP_IMAGE
+            APP_PORT=$APP_PORT
+            POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+            SESSION_SECRET=$SESSION_SECRET
+            # Ключ шифрования секретов в БД (ключи S3, токен бота). Пустой —
+            # значения хранятся открыто, как до QA-прогона 4: приложение
+            # работает, но дамп в бакете остаётся связкой ключей от этого же
+            # бакета. Задать секрет SETTINGS_KEY в репозитории и один раз
+            # пересохранить настройки в /settings — см. RUNBOOK.
+            SETTINGS_KEY=$SETTINGS_KEY
+            # Домен уже известен деплою — подставляем его как авторитетный
+            # источник абсолютных ссылок (Telegram-уведомления, регистрация
+            # вебхука), чтобы приложение не зависело от заголовков запроса.
+            APP_ORIGIN=https://$DOMAIN
+            # Необязательный: секрет для внешнего вызова пересчёта свежести
+            # (X-Cron-Secret). Прод-compose эту переменную ждёт, поэтому она
+            # пишется здесь всегда — пустая значит «снаружи не вызвать,
+            # только админ с сессией».
+            CRON_SECRET=$CRON_SECRET
+            EOF
+
+            chmod +x setup-server.sh
+            # apt-get/systemctl/nginx/certbot внутри setup-server.sh требуют
+            # root — `env` (не голое `sudo VAR=val ...`) передаёт переменные
+            # через sudo без правки sudoers на сервере.
+            $SUDO env DOMAIN="$DOMAIN" UPSTREAM_PORT="$APP_PORT" LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL" ./setup-server.sh
+
+            # Пакет в GHCR приватный — серверу нужно залогиниться, чтобы
+            # его скачать. GITHUB_TOKEN живёт ровно на время этого прогона,
+            # отдельного секрета под это заводить не нужно.
+            echo "$GHCR_TOKEN" | $SUDO docker login ${{ env.REGISTRY }} -u "$GHCR_USER" --password-stdin
+
+            $SUDO docker compose pull
+            $SUDO docker compose up -d
+
+            # Без этого ожидания сломанный образ (краш-луп, ошибка миграции)
+            # считался бы успешным деплоем — `docker compose up -d` только
+            # запускает контейнер, не проверяет, что он реально работает.
+            # healthcheck сервиса app (docker-compose.yml, /api/health)
+            # даёт объективный статус, на который можно опереться здесь.
+            echo "Ждём healthy статус контейнера app..."
+            for i in $(seq 1 30); do
+              status="$($SUDO docker inspect --format='{{.State.Health.Status}}' "$($SUDO docker compose ps -q app)" 2>/dev/null || echo starting)"
+              if [ "$status" = "healthy" ]; then
+                echo "app healthy"
+                break
+              fi
+              if [ "$status" = "unhealthy" ]; then
+                echo "app unhealthy — деплой провалился" >&2
+                $SUDO docker compose logs --tail=100 app
+                exit 1
+              fi
+              if [ "$i" = "30" ]; then
+                echo "Не дождались healthy за отведённое время" >&2
+                $SUDO docker compose logs --tail=100 app
+                exit 1
+              fi
+              sleep 5
+            done
+
+            # Каждый деплой тегирует образ уникальным github.sha (под откат
+            # на конкретный коммит) — без очистки старые образы копились бы
+            # на диске слабого сервера бесконечно. Полная история остаётся
+            # в GHCR, локально держать её не нужно.
+            $SUDO docker image prune -af
+            # Остановленные контейнеры (не только неиспользуемые образы) —
+            # та же логика: `docker compose up -d` пересоздаёт app на месте
+            # и не оставляет дублей сам по себе, но любой контейнер,
+            # остановленный вручную/другим способом, иначе копится вечно.
+            $SUDO docker container prune -f

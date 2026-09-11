@@ -1,0 +1,48 @@
+# Бутстрап-конфиг: используется только до того, как на сервере появится
+# сертификат Let's Encrypt (setup-server.sh ставит именно этот конфиг перед
+# первым certbot certonly — без него certbot не может пройти ACME-проверку,
+# а nginx откажется стартовать с конфигом, ссылающимся на ещё не существующий
+# сертификат из with-ssl.conf.template). После первого выпуска сертификата
+# setup-server.sh сам подменяет этот файл на with-ssl.conf.template.
+#
+# __DOMAIN__ и __PORT__ подставляются setup-server.sh из переменных
+# окружения DOMAIN/UPSTREAM_PORT — это не часть чистовика, каждый деплой
+# задаёт свои значения (см. README «CI/CD и деплой»).
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Тот же лимит, что в with-ssl.conf.template — этот конфиг тоже
+    # проксирует на приложение, пусть и временно, до первого сертификата.
+    client_max_body_size 60m;
+
+    # Тот же rate limiting, что в with-ssl.conf.template — см. комментарий
+    # там же и в rate-limit.conf.
+    location /api/auth/ {
+        limit_req zone=auth_limit burst=10 nodelay;
+        proxy_pass http://127.0.0.1:__PORT__;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Перетираем клиентский X-Forwarded-Host: приложение ему больше не
+        # доверяет (lib/telegram/origin.ts), но и пропускать подделку внутрь
+        # незачем.
+        proxy_set_header X-Forwarded-Host $host;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:__PORT__;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Перетираем клиентский X-Forwarded-Host: приложение ему больше не
+        # доверяет (lib/telegram/origin.ts), но и пропускать подделку внутрь
+        # незачем.
+        proxy_set_header X-Forwarded-Host $host;
+    }
+}

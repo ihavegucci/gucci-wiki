@@ -1,0 +1,67 @@
+# Явное имя проекта — иначе Compose называет его по имени папки, и если
+# эта копия окажется рядом с другим проектом в такой же по имени папке
+# (например, если её кто-то положит в каталог "app" или "deploy"), их
+# контейнеры незаметно сольются в один compose-проект.
+name: gucci-wiki
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gucci}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gucci}
+      POSTGRES_DB: ${POSTGRES_DB:-gucci_wiki}
+    volumes:
+      - gucci_wiki_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gucci}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Лимит — сервер может оказаться маленьким (используется вместе с другими
+    # сервисами на одной машине); без лимита один контейнер может съесть всю
+    # память. Локальной разработке лимит не мешает.
+    mem_limit: 250m
+
+  app:
+    image: ${APP_IMAGE:-gucci-wiki-app:local}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gucci}:${POSTGRES_PASSWORD:-gucci}@postgres:5432/${POSTGRES_DB:-gucci_wiki}
+      # Смените на длинную случайную строку для боевого развёртывания.
+      SESSION_SECRET: ${SESSION_SECRET:-change-me-to-a-long-random-string}
+      # Ключ шифрования секретов из /settings (ключи S3, токен бота) в БД.
+      # Пустой — они хранятся открытым текстом, как было раньше. Потеря
+      # ключа = настройки S3/бота нужно ввести заново, данные вики целы.
+      SETTINGS_KEY: ${SETTINGS_KEY:-}
+      NODE_ENV: production
+      # Адрес вики снаружи — авторитетный источник для абсолютных ссылок в
+      # Telegram и при регистрации вебхука. Пустой — берётся заголовок Host.
+      APP_ORIGIN: ${APP_ORIGIN:-}
+      # Необязательный секрет для внешнего вызова POST /api/freshness/recalculate.
+      # Пустой — эндпоинт доступен только админу с активной сессией.
+      CRON_SECRET: ${CRON_SECRET:-}
+    ports:
+      # 127.0.0.1, не 0.0.0.0 — наружу приложение торчит только через
+      # nginx-прокси (TLS, домен), не напрямую по порту. На локальной
+      # разработке ничего не меняет: localhost остаётся localhost.
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
+    mem_limit: 350m
+    # node -e с глобальным fetch, не curl/wget — node:24-alpine не
+    # гарантирует их наличие, Node ≥18 с fetch есть точно. /api/health
+    # проверяет и сам процесс, и доступность БД (SELECT 1), а не просто
+    # что порт слушает.
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  gucci_wiki_pg_data:
