@@ -11,6 +11,8 @@
 умирают: статьи протухают незаметно, нужное невозможно найти, а процессы живут
 в головах.
 
+<video src="https://github.com/user-attachments/assets/5f66d2e4-942f-42a1-89ee-7f5b110429bd" controls muted width="100%"></video>
+
 ---
 
 ## Содержание
